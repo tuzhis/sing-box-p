@@ -31,6 +31,7 @@ type Manager struct {
 	dependByTag             map[string][]string
 	defaultOutbound         adapter.Outbound
 	defaultOutboundFallback func() (adapter.Outbound, error)
+	defaultOutboundDirect   adapter.Outbound
 }
 
 func NewManager(logger logger.ContextLogger, registry adapter.OutboundRegistry, endpoint adapter.EndpointManager, defaultTag string) *Manager {
@@ -65,6 +66,7 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 			m.outbounds = append(m.outbounds, directOutbound)
 			m.outboundByTag[directOutbound.Tag()] = directOutbound
 			m.defaultOutbound = directOutbound
+			m.defaultOutboundDirect = directOutbound
 		}
 		if m.defaultTag != "" && m.defaultOutbound == nil {
 			defaultEndpoint, loaded := m.endpoint.Get(m.defaultTag)
@@ -203,6 +205,18 @@ func (m *Manager) Default() adapter.Outbound {
 	return m.defaultOutbound
 }
 
+func (m *Manager) DefaultDirect() adapter.Outbound {
+	m.access.RLock()
+	defer m.access.RUnlock()
+	if m.defaultOutboundDirect == nil {
+		directOutbound, _ := m.defaultOutboundFallback()
+		m.outbounds = append(m.outbounds, directOutbound)
+		m.outboundByTag[directOutbound.Tag()] = directOutbound
+		m.defaultOutboundDirect = directOutbound
+	}
+	return m.defaultOutboundDirect
+}
+
 func (m *Manager) Remove(tag string) error {
 	m.access.Lock()
 	defer m.access.Unlock()
@@ -245,6 +259,10 @@ func (m *Manager) Remove(tag string) error {
 		return common.Close(outbound)
 	}
 	return nil
+}
+
+func (m *Manager) CreateOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) (adapter.Outbound, error) {
+	return m.registry.CreateOutbound(ctx, router, logger, tag, inboundType, options)
 }
 
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
