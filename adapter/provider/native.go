@@ -10,8 +10,8 @@ import (
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
-	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/byteformats"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
@@ -22,6 +22,7 @@ var (
 	vmessParser     = regexp.MustCompile(`^(.*?)@(.*?):(\d+)(?:(?:\/|\?|\/\?)(.*?))?(?:#(.*?))$`)
 	vlessParser     = regexp.MustCompile(`^(.*?)@(.*?):(\d+)(?:(?:\/|\?|\/\?)(.*?))?(?:#(.*?))$`)
 	trojanParser    = regexp.MustCompile(`^(.*?)@(.*?):(\d+)(?:(?:\/|\?|\/\?)(.*?))?(?:#(.*?))$`)
+	socksParser     = regexp.MustCompile(`^(.*?)@(.*?):(\d+)(?:(?:\/|\?|\/\?)(.*?))?(?:#(.*?))$`)
 	hysteriaParser  = regexp.MustCompile(`^(.*?):(\d+)(?:(?:\/|\?|\/\?)(.*?))?(?:#(.*?))?$`)
 	hysteria2Parser = regexp.MustCompile(`^(.+?)@(.+?)(?::(\d+))?(?:(?:\/|\?|\/\?)(.*?))?(?:#(.*?))?$`)
 	anytlsParser    = regexp.MustCompile(`^(.*?)@(.*?):(\d+)(?:(?:\/|\?|\/\?)(.*?))?(?:#(.*?))$`)
@@ -40,7 +41,9 @@ func newNativeURIParser(content string) ([]option.Outbound, error) {
 			err      error
 		)
 		protocol := strings.ToLower(strings.TrimSpace(splitedArr[0]))
+
 		parsedProxy := strings.TrimSpace(decodeBase64Safe(strings.TrimSpace(splitedArr[1])))
+
 		switch protocol {
 		case "ss":
 			outbound, err = newSSNativeParser(parsedProxy)
@@ -54,6 +57,8 @@ func newNativeURIParser(content string) ([]option.Outbound, error) {
 			outbound, err = newVLESSNativeParser(parsedProxy)
 		case "trojan":
 			outbound, err = newTrojanNativeParser(parsedProxy)
+		case "socks", "socks5":
+			outbound, err = newSOCKSNativeParser(parsedProxy)
 		case "hysteria":
 			outbound, err = newHysteriaNativeParser(parsedProxy)
 		case "hy2", "hysteria2":
@@ -691,7 +696,7 @@ func newHysteria2NativeParser(content string) (option.Outbound, error) {
 	if len(result) == 0 {
 		return outbound, E.New("invalid hysteria2 uri")
 	}
-	outbound.Tag = result[5]
+	outbound.Tag = decodeURIComponent(result[5])
 	options := option.Hysteria2OutboundOptions{}
 	TLSOptions := option.OutboundTLSOptions{
 		Enabled: true,
@@ -709,22 +714,46 @@ func newHysteria2NativeParser(content string) (option.Outbound, error) {
 	if result[3] != "" {
 		options.ServerPort = stringToUint16(result[3])
 	}
-	for _, addon := range strings.Split(result[4], "\n") {
-		key, value := splitKeyValueWithEqual(addon)
-		switch key {
-		case "up":
-			options.UpMbps, _ = strconv.Atoi(value)
-		case "down":
-			options.DownMbps, _ = strconv.Atoi(value)
-		case "obfs":
-			if value == "salamander" {
-				options.Obfs.Type = "salamander"
-			}
-		case "obfs-password":
-			options.Obfs.Password = value
-		case "insecure", "skip-cert-verify":
-			if value == "1" || value == "true" {
-				TLSOptions.Insecure = true
+
+	// Parse query parameters correctly using & separator
+	if result[4] != "" {
+		for _, addon := range strings.Split(decodeURIComponent(result[4]), "&") {
+			key, value := splitKeyValueWithEqual(addon)
+			switch key {
+			case "up":
+				options.UpMbps, _ = strconv.Atoi(value)
+			case "down":
+				options.DownMbps, _ = strconv.Atoi(value)
+			case "obfs":
+				if value == "salamander" {
+					if options.Obfs == nil {
+						options.Obfs = &option.Hysteria2Obfs{}
+					}
+					options.Obfs.Type = "salamander"
+				}
+			case "obfs-password":
+				if options.Obfs == nil {
+					options.Obfs = &option.Hysteria2Obfs{}
+				}
+				options.Obfs.Password = value
+			case "insecure", "skip-cert-verify":
+				if value == "1" || value == "true" {
+					TLSOptions.Insecure = true
+				}
+			case "sni":
+				TLSOptions.ServerName = value
+			case "alpn":
+				TLSOptions.ALPN = strings.Split(value, ",")
+			case "mport":
+				// Handle multi-port range like "500-600"
+				if strings.Contains(value, "-") {
+					// Convert "500-600" to "500:600" format expected by sing-box
+					portRange := strings.Replace(value, "-", ":", 1)
+					options.ServerPorts = badoption.Listable[string]{portRange}
+				} else {
+					// Single port in mport parameter
+					options.ServerPorts = badoption.Listable[string]{value}
+				}
 			}
 		}
 	}
@@ -779,5 +808,66 @@ func newAnyTLSNativeParser(content string) (option.Outbound, error) {
 	}
 	options.TLS = &TLSOptions
 	outbound.Options = &options
+	return outbound, nil
+}
+
+func newSOCKSNativeParser(content string) (option.Outbound, error) {
+	outbound := option.Outbound{
+		Type: C.TypeSOCKS,
+	}
+
+	// First URL decode the content
+	content = decodeURIComponent(content)
+
+	result := socksParser.FindStringSubmatch(content)
+	if len(result) == 0 {
+		return outbound, E.New("invalid socks uri")
+	}
+	outbound.Tag = decodeURIComponent(result[5])
+	options := option.SOCKSOutboundOptions{
+		Version: "5",
+	}
+	options.Server = result[2]
+	options.ServerPort = stringToUint16(result[3])
+
+	// Parse username:password from result[1]
+	if result[1] != "" {
+		auth := decodeBase64Safe(result[1])
+		if auth != "" && auth != ":" {
+			if strings.Contains(auth, ":") {
+				authParts := strings.Split(auth, ":")
+				options.Username = authParts[0]
+				if len(authParts) > 1 {
+					options.Password = authParts[1]
+				}
+			} else {
+				options.Username = auth
+			}
+		}
+		// If auth is empty or just ":", don't set username/password (use no auth)
+	}
+
+	// Parse additional options from query parameters
+	if result[4] != "" {
+		for _, addon := range strings.Split(decodeURIComponent(result[4]), "&") {
+			key, value := splitKeyValueWithEqual(addon)
+			switch key {
+			case "version":
+				if value == "4" || value == "4a" {
+					options.Version = value
+				}
+			case "uot", "udp-over-tcp":
+				if value == "1" || value == "true" {
+					options.UDPOverTCP = &option.UDPOverTCPOptions{Enabled: true}
+				}
+			case "tfo", "tcp-fast-open", "tcp_fast_open":
+				if value == "1" || value == "true" {
+					options.DialerOptions.TCPFastOpen = true
+				}
+			}
+		}
+	}
+
+	outbound.Options = options
 	return outbound, nil
 }
